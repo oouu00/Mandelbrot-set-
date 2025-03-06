@@ -1,3 +1,4 @@
+
 import os
 import numpy as np
 import matplotlib.pyplot as plt
@@ -5,7 +6,6 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from tkinter import Tk, Label, Entry, Button, StringVar, filedialog, messagebox, OptionMenu, Frame
 import time
 import traceback
-import numba
 import gmpy2
 from gmpy2 import mpfr, mpc, get_context, log10
 import pyopencl as cl
@@ -14,6 +14,9 @@ from multiprocessing import Process, Queue, cpu_count
 import tempfile
 
 import subprocess  # 确保导入 subprocess 模块
+
+from threading import Thread
+
 
 
 
@@ -42,43 +45,7 @@ MAX_WORKERS = WORKERS
     
     
     
-# ================== 核心计算模块 ==================
-@numba.jit(nopython=True, parallel=True, fastmath=True, cache=True)
-def numba_mandelbrot(x_min, x_max, y_min, y_max, width, height, max_iter):
-    """Numba加速的普通精度计算"""
-    output = np.zeros((height, width), dtype=np.float64)
-    y_values = np.linspace(y_min, y_max, height)
-    x_values = np.linspace(x_min, x_max, width)
-    
-    for i in numba.prange(height):
-        y = y_values[i]
-        for j in range(width):
-            x = x_values[j]
-            cr = x
-            ci = y
-            zr = 0.0
-            zi = 0.0
-            n = 0
-            while n < max_iter:
-                zr2 = zr * zr
-                zi2 = zi * zi
-                if zr2 + zi2 > 4.0:
-                    break
-                zi = 2 * zr * zi + ci
-                zr = zr2 - zi2 + cr
-                n += 1
-            
-            if n < max_iter:
-                modulus = zr2 + zi2
-                if modulus > 1e-10:  # 避免log(0)
-                    log_zn = np.log(modulus) / 2
-                    nu = np.log(log_zn / np.log(2)) / np.log(2)
-                    output[i, j] = n + 1 - nu
-                else:
-                    output[i, j] = n
-            else:
-                output[i, j] = max_iter
-    return output
+# ================== 核心计算模块 =======
     
 
 
@@ -152,6 +119,84 @@ def initialize_opencl():
 # ================== GUI界面模块 ==================
 class MandelbrotGenerator:
 
+
+
+
+
+
+
+    def gmp_high_precision_compute(self, x_min, x_max, y_min, y_max, width, height, max_iter, precision, current_task):
+        """高精度计算 Mandelbrot 集"""
+        # 从 MandelbrotGenerator 类的实例中获取当前参数
+        current_params = self.validate_parameters()  # 获取当前参数
+        if current_params is None:
+            raise ValueError("参数验证失败")
+        
+        # 计算二进制精度
+        binary_precision = int(precision * 3.324) + 16
+        print(f"二进制精度: {binary_precision}")
+        
+        thread_count = WORKERS
+        print(f"线程数: {thread_count}")
+        print(f"初始缩放比例: {current_params['initial_scale']}")
+      
+        # 计算当前缩放比例
+        current_scale2 = mpfr(current_params['initial_scale']) / (mpfr(current_params['zoom_factor']) ** (current_task - 1))
+        
+        percentile3 = float(self.percentile_entry.get())  # 从输入框获取百分位数
+        
+        percentile2 = log10(percentile3) / 2  # 使用 gmpy2 的 log10 函数
+
+
+        
+        # 将参数写入临时文件
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        file_path = os.path.join(script_dir, "mandelbrot.txt")
+
+        with open(file_path, "w") as temp_file:
+            temp_file.write(f"{thread_count}\n")
+            temp_file.write(f"{binary_precision}\n")
+            temp_file.write(f"{current_params['center_x']}\n")
+            temp_file.write(f"{current_params['center_y']}\n")
+            temp_file.write(f"{width}\n")
+            temp_file.write(f"{height}\n")
+            temp_file.write(f"{str(current_scale2)}\n")
+            temp_file.write(f"{current_params['focus_x']}\n")
+            temp_file.write(f"{current_params['focus_y']}\n")
+            temp_file.write(f"{current_params['max_iter']}\n")
+            temp_file.write(f"{percentile2}\n")
+            
+            
+            
+            
+            temp_file.flush()  # 确保内容写入磁盘
+            
+        # 切换工作目录到文件所在路径
+        os.chdir(script_dir)  # 切换到脚本目录
+
+
+        # 调用 Mandelbrot.exe 并传递临时文件路径
+        command = f"Mandelbrot.exe mandelbrot.txt"
+        print(f"执行命令: {command}")
+    
+        self.mandelbrot_process = subprocess.Popen(command, shell=True)  # 保存进程对象
+        while self.mandelbrot_process.poll() is None:
+            if not generating:
+                # 强行终止 Mandelbrot.exe 进程
+                subprocess.run("taskkill /F /IM Mandelbrot.exe", shell=True)
+                raise Exception("计算已终止")
+            time.sleep(0.2)
+        # 处理结果...
+        
+                        
+        print("命令完成")
+    
+        # 加载结果文件
+        output = self.load_iteration_array_from_file(width, height)
+        if output is None:
+            raise FileNotFoundError("未找到 iteration_array.bin 文件或文件格式不正确")
+        return output
+
     def load_iteration_array_from_file(self, width, height):
         """从文件中加载迭代次数数组"""
         file_path = "iteration_array.bin"
@@ -162,13 +207,14 @@ class MandelbrotGenerator:
         try:
             # 打开文件并读取数据
             with open(file_path, "rb") as file:
-                # 假设文件存储的是浮点数格式的二维数组
-                data = np.fromfile(file, dtype=np.float32)
+                # 假设文件存储的是整数的二维数组
+                data = np.fromfile(file, dtype=np.int32)
                 if len(data) != width * height:
                     print(f"文件 {file_path} 的数据大小与预期不符")
                     return None
                 # 将数据重塑为二维数组
                 output = data.reshape((height, width))
+               
                 return output
         except Exception as e:
             print(f"读取文件 {file_path} 时出错: {str(e)}")
@@ -216,96 +262,117 @@ class MandelbrotGenerator:
                 # 高精度并行模式（原有实现）
                 self.current_method = "gmp高精度计算"  # 高精度模式
                 # 从 MandelbrotGenerator 类的实例中获取当前参数
-                current_params = self.validate_parameters()  # 获取当前参数
-                if current_params is None:
-                    raise ValueError("参数验证失败")
-                # 生成命令行并执行 Mandelbrot.exe
-                binary_precision = int(precision * 3.324) + 16
-                print(binary_precision)
+                return self.gmp_high_precision_compute(x_min, x_max, y_min, y_max, width, height, max_iter, precision, current_task)
+        
                 
-                
-                thread_count = WORKERS
-                print(current_params['initial_scale'])
-              
-                
-                  
-          
-                current_scale2 = mpfr(current_params['initial_scale']) / (mpfr(current_params['zoom_factor']) ** (current_task - 1))
-                
-                
-                
-
-                              
-                #将参数写入临时文件
-                # 获取脚本所在的目录
-                script_dir = os.path.dirname(os.path.abspath(__file__))
-                file_path = os.path.join(script_dir, "mandelbrot.txt")
-
-                # 打开文件进行写入
-                with open(file_path, "w") as temp_file:
-          
-                    temp_file.write(f"{thread_count}\n")
-                    temp_file.write(f"{binary_precision}\n")
-                    temp_file.write(f"{current_params['center_x']}\n")
-                    temp_file.write(f"{current_params['center_y']}\n")
-                    temp_file.write(f"{width}\n")
-                    temp_file.write(f"{height}\n")
-                    temp_file.write(f"{str(current_scale2)}\n")
-                    temp_file.write(f"{current_params['focus_x']}\n")
-                    temp_file.write(f"{current_params['focus_y']}\n")
-                    temp_file.write(f"{current_params['max_iter']}\n")
-                    temp_file.flush()  # 确保内容写入磁盘
-
-
-
-
-
-                    temp_file.flush()
-
-                # 调用 Mandelbrot.exe 并传递临时文件路径
-                command = f"Mandelbrot.exe mandelbrot.txt"
-                
-                print(command)
-                subprocess.run(command, shell=True)          
-                print("命令完成")
-            
-                output = self.load_iteration_array_from_file(width, height)
-                if output is None:
-                    raise FileNotFoundError("未找到 iteration_array.bin 文件或文件格式不正确")
-                return output       
             else:
                 try:
                     # 尝试使用 GPU 加速
                     self.current_method = "OpenCL"  # 尝试OpenCL
                     return self.opencl_mandelbrot(x_min, x_max, y_min, y_max, width, height, max_iter)
-                except Exception as e:
-                    print(f"GPU计算失败，回退到CPU: {str(e)}")
-                    self.current_method = "Numba"  # OpenCL失败回退到Numba
-                    return numba_mandelbrot(
-                        np.float64(x_min), np.float64(x_max),
-                        np.float64(y_min), np.float64(y_max),
-                        width, height, max_iter
-                    )
-        except Exception as e:
-            traceback.print_exc()
-            raise RuntimeError(f"计算错误: {str(e)}")
+                except:
+                    # 使用普通 CPU 计算
+                    self.current_method = "opencl失败，切gmp高精度计算"
+                    return self.gmp_high_precision_compute(x_min, x_max, y_min, y_max, width, height, max_iter, precision, current_task)
 
+        except Exception as e:
+            print(f"计算错误: {str(e)}")
+            raise
+
+
+    def cpu_mandelbrot(self, x_min, x_max, y_min, y_max, width, height, max_iter):
+        """使用普通 CPU 计算 Mandelbrot 集"""
+        output = np.zeros((height, width), dtype=np.float32)
+
+        for i in range(height):
+            for j in range(width):
+                x = x_min + (x_max - x_min) * j / (width - 1)
+                y = y_min + (y_max - y_min) * i / (height - 1)
+                cr = x
+                ci = y
+                zr = 0.0
+                zi = 0.0
+                n = 0
+                zr2, zi2 = 0.0, 0.0
+
+                while n < max_iter:
+                    zr2 = zr * zr
+                    zi2 = zi * zi
+                    if zr2 + zi2 > 4.0:
+                        break
+                    zi = 2 * zr * zi + ci
+                    zr = zr2 - zi2 + cr
+                    n += 1
+
+                if n < max_iter:
+                    result = n + 1 - np.log(np.log(np.sqrt(zr2 + zi2)) / np.log(2.0)) / np.log(2.0)
+                else:
+                    result = max_iter
+                output[i, j] = result
+
+        return output
 
 
     def opencl_mandelbrot(self, x_min, x_max, y_min, y_max, width, height, max_iter):
         """使用 OpenCL 计算 Mandelbrot 集 (同步优化版)"""
-        
         # 创建输出缓冲区和映射
         output = np.empty((height, width), dtype=np.float32)
-
-        # 使用 ALLOC_HOST_PTR 创建页锁定内存
         output_buf = cl.Buffer(
             self.ctx, 
             cl.mem_flags.WRITE_ONLY | cl.mem_flags.ALLOC_HOST_PTR,
             size=output.nbytes
         )
+
+        # 预计算：缩小 10 倍的宽度和高度
+        pre_width = max(width // 10, 1)  # 防止宽度或高度为 0
+        pre_height = max(height // 10, 1)  # 防止宽度或高度为 0
+        pre_output = np.empty((pre_height, pre_width), dtype=np.float32)
+        pre_output_buf = cl.Buffer(
+            self.ctx, 
+            cl.mem_flags.WRITE_ONLY | cl.mem_flags.ALLOC_HOST_PTR,
+            size=pre_output.nbytes
+        )
+
+        # 同步执行预计算内核
+        global_size = (pre_width, pre_height)  # 使用2D全局工作尺寸
+        pre_kernel_event = self.prg.mandelbrot(
+            self.queue, global_size, None,  # 自动选择工作组大小
+            pre_output_buf,
+            np.float64(x_min), np.float64(x_max),
+            np.float64(y_min), np.float64(y_max),
+            np.int32(pre_width), np.int32(pre_height),
+            np.int32(max_iter)
+        )
+        pre_kernel_event.wait()  # 等待内核完成
+
+        # 映射预计算结果
+        mapped_pre_data, _ = cl.enqueue_map_buffer(
+            self.queue, pre_output_buf,
+            cl.map_flags.READ,
+            0, pre_output.shape, pre_output.dtype
+        )
+        np.copyto(pre_output, mapped_pre_data)
+
+        # 去除所有重复的最大值
+        max_iter_value = np.max(pre_output)  # 获取最大迭代次数的值
+        pre_output[pre_output == max_iter_value] = 0  # 将最大值替换为 NaN
+
+
+        percentile = float(self.percentile_entry.get()) # 从输入框获取百分位数
+
         
-        # 同步执行内核
+        percentile_log = log10(percentile) * 50 # 使用 gmpy2 的 log10 函数并校准
+        percentile_log = float(percentile_log) # 从输入框获取百分位数
+
+        
+
+        # 计算新的最大迭代次数（取 98% 的位置）
+        new_max_iter = int(np.percentile(pre_output, percentile_log))
+        
+        new_max_iter = max(new_max_iter, 100)  # 确保 new_max_iter 不小于 100
+        print(f"预计算完成，新的最大迭代次数: {new_max_iter}")
+
+        # 正式计算：使用新的最大迭代次数
         global_size = (width, height)  # 使用2D全局工作尺寸
         kernel_event = self.prg.mandelbrot(
             self.queue, global_size, None,  # 自动选择工作组大小
@@ -313,21 +380,11 @@ class MandelbrotGenerator:
             np.float64(x_min), np.float64(x_max),
             np.float64(y_min), np.float64(y_max),
             np.int32(width), np.int32(height),
-            np.int32(max_iter)
+            np.int32(new_max_iter)
         )
         kernel_event.wait()  # 等待内核完成
 
-
-        # 兼容性内存映射
-        mapped_data, _ = cl.enqueue_map_buffer(
-            self.queue, output_buf,
-            cl.map_flags.READ,
-            0, output.shape, output.dtype
-        )
-
-        # 异步拷贝数据
-
-    
+        # 映射正式计算结果
         mapped_data, _ = cl.enqueue_map_buffer(
             self.queue, output_buf,
             cl.map_flags.READ,
@@ -335,8 +392,8 @@ class MandelbrotGenerator:
         )
         np.copyto(output, mapped_data)
 
-        # 旧版本自动解除映射
         return output
+
 
 
 
@@ -444,11 +501,13 @@ class MandelbrotGenerator:
         self.root = root
         self.current_image = None  # 初始化为 None 或其他默认值
         self.current_metadata = {}  # 初始化为一个空字典
+        self.mandelbrot_process = None  # 用于存储 Mandelbrot.exe 的进程对象
+    
         self.setup_ui()
         self.setup_plot()
         # 初始化 OpenCL 环境
         self.ctx, self.queue, self.prg = initialize_opencl()
-        self.current_method = "Numba"  # 默认使用Numba
+        self.current_method = "OpenCL"  # 默认使用Numba
 
         
     def setup_ui(self):
@@ -511,10 +570,17 @@ class MandelbrotGenerator:
         self.scale_entry.grid(row=row, column=1, columnspan=3, padx=2)
 
         row += 1
-        Label(parent, text="最大迭代次数", font=('微软雅黑', 10)).grid(row=row, column=0, sticky="w", pady=2)
+        Label(parent, text="动态迭代数上限", font=('微软雅黑', 10)).grid(row=row, column=0, sticky="w", pady=2)
         self.max_iter_entry = Entry(parent, width=8, font=('微软雅黑', 10))
-        self.max_iter_entry.insert(0, "500")
+        self.max_iter_entry.insert(0, "9999")
         self.max_iter_entry.grid(row=row, column=1, padx=2)
+        
+        row += 1
+        Label(parent, text="动态迭代阈值(0-100)", font=('微软雅黑', 10)).grid(row=row, column=0, sticky="w", pady=2)
+        self.percentile_entry = Entry(parent, width=8, font=('微软雅黑', 10))
+        self.percentile_entry.insert(0, "90")  # 默认值为 90
+        self.percentile_entry.grid(row=row, column=1, padx=2)
+
 
         row += 1
         Label(parent, text="生成数量", font=('微软雅黑', 10)).grid(row=row, column=0, sticky="w", pady=2)
@@ -593,11 +659,13 @@ class MandelbrotGenerator:
     def toggle_inputs(self, state):
         """切换输入控件状态"""
         entries = [
-            self.width_entry, self.height_entry,
-            self.center_x_entry, self.center_y_entry,
-            self.scale_entry, self.max_iter_entry,
-            self.num_images_entry, self.zoom_factor_entry
-        ]
+        self.width_entry, self.height_entry,
+        self.center_x_entry, self.center_y_entry,
+        self.scale_entry, self.max_iter_entry,
+        self.num_images_entry, self.zoom_factor_entry,
+        self.focus_x_entry, self.focus_y_entry,
+        self.percentile_entry, self.precision_threshold_entry
+    ]
         for entry in entries:
             entry.config(state='normal' if state else 'disabled')
         self.browse_button.config(state='normal' if state else 'disabled')
@@ -609,13 +677,13 @@ class MandelbrotGenerator:
             self.save_path_var.set(path)
 
     def update_progress(self):
-        """更新进度显示"""
-        global current_task, total_tasks
-        if total_tasks > 0:
-            progress = f"进度: {current_task}/{total_tasks} ({current_task/total_tasks*100:.1f}%)"
-            self.status_var.set(progress)
-            if current_task == total_tasks:
-                self.status_var.set("生成完成")
+        if not generating: return
+        self.root.after(0, lambda: 
+        self.status_var.set(f"进度: {current_task}/{total_tasks}"))
+
+
+        if current_task == total_tasks:
+            self.status_var.set("生成完成")
         self.root.update_idletasks()
 
     def update_canvas(self, output, metadata):
@@ -636,11 +704,20 @@ class MandelbrotGenerator:
             ax.imshow(output, cmap=selected_colormap, 
                   extent=[0, default_width, 0, default_height],  # 使用默认的宽度和高度
                   origin='lower')
+                  
+            # 计算迭代次数范围
+            outmin_iter = int(np.min(output))
+            outmax_iter = int(np.max(output))
 
 
-            title = f"Mandelbrot集 - 当前计算方法: {self.current_method}\n"
-            title += f"鼠标点图片可以继续放大,拖动可以移动 (第{metadata['task_id']}帧)\n"
-            title += f"计算时间: {metadata['compute_time']:.2f}s | 当前精度: {metadata['precision']}位"
+
+            title = f"当前计算方法: {self.current_method}"          
+            title += f"点击放大,拖动移动\n"
+            title += f"实际迭代范围: [{outmin_iter}, {outmax_iter}]\n"
+            title += f"计算时间: {metadata['compute_time']:.2f}s | 当前精度: {metadata['precision']}位 (第{metadata['task_id']}帧)"
+            
+
+            
             
             ax.set_title(title)
             #ax.set_xlabel("实部")
@@ -666,10 +743,18 @@ class MandelbrotGenerator:
             self.generate_button.config(text="开始生成", state='normal')
             self.status_var.set("已终止")
             self.toggle_inputs(True)
+        # 强行终止 Mandelbrot.exe 进程
+            if self.mandelbrot_process and self.mandelbrot_process.poll() is None:
+                subprocess.run("taskkill /F /IM Mandelbrot.exe", shell=True)
+    
         else:
             self.start_generation()
 
     def start_generation(self):
+        
+        
+    
+    
         """开始生成任务"""
         global generating, current_task, total_tasks
         
@@ -692,7 +777,10 @@ class MandelbrotGenerator:
             print(f"任务队列创建完成，共有 {len(tasks)} 个任务。")
             
             # 处理任务队列
-            self.process_tasks(tasks, params)
+            # 启动后台线程
+            self.generation_thread = Thread(target=self.process_tasks, args=(tasks, params))
+            self.generation_thread.start()
+    
             print("所有任务处理完成。")
         
         except Exception as e:
@@ -841,7 +929,10 @@ class MandelbrotGenerator:
             }
             self.current_image = output
             self.current_metadata = metadata
-            self.update_canvas(output, metadata)
+            
+             # 更新界面使用after方法
+            self.root.after(0, self.update_canvas, output, metadata)
+            
             print("更新完界面时间")
             print(time.time())
         # 清理状态
@@ -852,8 +943,10 @@ class MandelbrotGenerator:
 
     def cleanup_after_error(self):
         """出错后清理"""
-        global generating
+        global generating     
         generating = False
+        if hasattr(self, 'generation_thread'):
+            self.generation_thread.join(0)
         self.generate_button.config(text="开始生成", state='normal')
         self.status_var.set("就绪")
         self.toggle_inputs(True)
