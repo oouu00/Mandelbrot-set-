@@ -6,6 +6,11 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+// 定义比较函数
+int compare(const void* a, const void* b) {
+    return (*(int*)a - *(int*)b);  // 升序排序
+}
+
 
 // 定义 ThreadParams 结构体
 typedef struct {
@@ -17,6 +22,10 @@ typedef struct {
     int iYmax;
     int IterationMax;
 } ThreadParams;
+
+int min_iter = 0;  // 最小迭代次数
+double percentile = 0.98;  // 默认值为 0.98
+
 
 // 默认参数
 int NUM_THREADS = 4;  // 线程数量
@@ -56,6 +65,145 @@ void SaveIterationArrayAsBinary(const char* filename, int width, int height)
     fclose(file);
 }
 
+//采样函数
+
+int CalculateNewMaxIter(int iXmax, int iYmax, mpfr_t* mpfrVars, int max_iter)
+{
+    // 每次采样跳10个像素
+    int step = 10;
+
+    // 计算实际采样点的数量
+    int sampleX = (iXmax + step - 1) / step;  // 向上取整
+    int sampleY = (iYmax + step - 1) / step;  // 向上取整
+    int totalSamples = sampleX * sampleY;
+
+    // 动态分配内存存储采样结果
+    int* sampleIterations = (int*)malloc(totalSamples * sizeof(int));
+    if (!sampleIterations)
+    {
+        printf("Failed to allocate memory for sampleIterations\n");
+        exit(1);
+    }
+
+    mpfr_t Cx, Cy, Zx, Zy, Zx2, Zy2, temp, ER2;
+    mpfr_inits2(precision, Cx, Cy, Zx, Zy, Zx2, Zy2, temp, ER2, (mpfr_ptr)0);
+    mpfr_set_d(ER2, EscapeRadius * EscapeRadius, MPFR_RNDN);
+
+    int sampleIndex = 0;
+    for (int iY = 0; iY < iYmax; iY += step)  // 每次增加 step
+    {
+        mpfr_set_ui(temp, iY, MPFR_RNDN);
+        mpfr_mul(temp, temp, mpfrVars[5], MPFR_RNDN);  // pixel_height
+        mpfr_add(Cy, mpfrVars[2], temp, MPFR_RNDN);     // y_min + iY * pixel_height
+
+        for (int iX = 0; iX < iXmax; iX += step)  // 每次增加 step
+        {   
+            mpfr_set_ui(temp, iX, MPFR_RNDN);
+            mpfr_mul(temp, temp, mpfrVars[4], MPFR_RNDN);  // pixel_width
+            mpfr_add(Cx, mpfrVars[0], temp, MPFR_RNDN);     // x_min + iX * pixel_width
+
+            mpfr_set_d(Zx, 0.0, MPFR_RNDN);
+            mpfr_set_d(Zy, 0.0, MPFR_RNDN);
+            mpfr_set_d(Zx2, 0.0, MPFR_RNDN);
+            mpfr_set_d(Zy2, 0.0, MPFR_RNDN);
+
+            int Iteration = 0;
+            mpfr_add(temp, Zx2, Zy2, MPFR_RNDN);  // temp = Zx2 + Zy2
+            while (Iteration < max_iter && mpfr_cmp(temp, ER2) < 0)
+            {
+                mpfr_mul(temp, Zx, Zy, MPFR_RNDN);
+                mpfr_mul_2exp(temp, temp, 1, MPFR_RNDN);  // temp = 2 * Zx * Zy
+                mpfr_add(Zy, temp, Cy, MPFR_RNDN);
+
+                mpfr_sub(temp, Zx2, Zy2, MPFR_RNDN);
+                mpfr_add(Zx, temp, Cx, MPFR_RNDN);
+
+                mpfr_mul(Zx2, Zx, Zx, MPFR_RNDN);
+                mpfr_mul(Zy2, Zy, Zy, MPFR_RNDN);
+
+                mpfr_add(temp, Zx2, Zy2, MPFR_RNDN);  // temp = Zx2 + Zy2
+                Iteration++;
+            }
+
+            sampleIterations[sampleIndex++] = Iteration;  // 保存迭代次数
+        }
+    }
+    
+    // 在采样循环结束后，找到最小迭代次数
+    int minIteration = sampleIterations[0];
+    for (int i = 0; i < totalSamples; i++)
+    {
+        if (sampleIterations[i] < minIteration)
+        {
+            minIteration = sampleIterations[i];
+        }
+    }
+    min_iter = minIteration;  // 更新全局变量 min_iter
+    printf("  Min Iterations: %d\n", min_iter);
+
+
+    // 找到最大迭代次数并删除
+    int maxIteration = 0;
+    for (int i = 0; i < totalSamples; i++)
+    {
+        if (sampleIterations[i] > maxIteration)
+        {
+            maxIteration = sampleIterations[i];
+        }
+    }
+
+    // 删除最大值
+    int* filteredIterations = (int*)malloc((totalSamples - 1) * sizeof(int));
+    if (!filteredIterations)
+    {
+        printf("Failed to allocate memory for filteredIterations\n");
+        exit(1);
+    }
+
+    int filteredIndex = 0;
+    for (int i = 0; i < totalSamples; i++)
+    {
+        if (sampleIterations[i] != maxIteration)
+        {
+            filteredIterations[filteredIndex++] = sampleIterations[i];
+        }
+    }
+
+    // 使用过滤后的数组计算98%分位数
+    int* sortedIterations = (int*)malloc(filteredIndex * sizeof(int));
+    if (!sortedIterations)
+    {
+        printf("Failed to allocate memory for sortedIterations\n");
+        exit(1);
+    }
+    memcpy(sortedIterations, filteredIterations, filteredIndex * sizeof(int));
+    qsort(sortedIterations, filteredIndex, sizeof(int), compare);
+
+    int newMaxIter = sortedIterations[(int)(percentile * filteredIndex)];
+
+    // 将 newMaxIter 与 100 比较，取最大值
+    newMaxIter = (newMaxIter > 100) ? newMaxIter : 100;
+
+    printf("Sample Iterations Statistics:\n");
+    printf("  Total Samples: %d\n", totalSamples);
+    printf("  Min Iterations: %d\n", sortedIterations[0]);
+    printf("  Max Iterations: %d\n", sortedIterations[filteredIndex - 1]);
+    printf("  98%% Percentile Iterations: %d\n", newMaxIter);
+
+    free(sampleIterations);
+    free(sortedIterations);
+    free(filteredIterations);
+
+
+    mpfr_clears(Cx, Cy, Zx, Zy, Zx2, Zy2, temp, ER2, (mpfr_ptr)0);
+
+    return newMaxIter;
+}
+
+
+
+
+
 // 线程函数
 unsigned __stdcall MandelbrotThread(void* param)
 {
@@ -91,31 +239,42 @@ unsigned __stdcall MandelbrotThread(void* param)
             mpfr_set_d(Zy2, 0.0, MPFR_RNDN);
 
             int Iteration = 0;
-            mpfr_add(temp, Zx2, Zy2, MPFR_RNDN);  // temp = Zx2 + Zy2
-            while (Iteration < IterationMax && mpfr_cmp(temp, ER2) < 0)
+// 在前100次迭代中只计算，不判断逃逸
+        while (Iteration < IterationMax)
+        {
+            mpfr_mul(temp, Zx, Zy, MPFR_RNDN);
+            mpfr_mul_2exp(temp, temp, 1, MPFR_RNDN);  // temp = 2 * Zx * Zy
+            mpfr_add(Zy, temp, Cy, MPFR_RNDN);
+
+            mpfr_sub(temp, Zx2, Zy2, MPFR_RNDN);
+            mpfr_add(Zx, temp, Cx, MPFR_RNDN);
+
+            mpfr_mul(Zx2, Zx, Zx, MPFR_RNDN);
+            mpfr_mul(Zy2, Zy, Zy, MPFR_RNDN);
+
+            // 只有在迭代次数达到100次之后才开始判断是否逃逸
+            if (Iteration >= min_iter)
             {
-                mpfr_mul(temp, Zx, Zy, MPFR_RNDN);
-                mpfr_mul_2exp(temp, temp, 1, MPFR_RNDN);  // temp = 2 * Zx * Zy
-                mpfr_add(Zy, temp, Cy, MPFR_RNDN);
-
-                mpfr_sub(temp, Zx2, Zy2, MPFR_RNDN);
-                mpfr_add(Zx, temp, Cx, MPFR_RNDN);
-
-                mpfr_mul(Zx2, Zx, Zx, MPFR_RNDN);
-                mpfr_mul(Zy2, Zy, Zy, MPFR_RNDN);
-
                 mpfr_add(temp, Zx2, Zy2, MPFR_RNDN);  // temp = Zx2 + Zy2
-                Iteration++;
+                if (mpfr_cmp(temp, ER2) >= 0)  // 如果逃逸，退出循环
+                {
+                    break;
+                }
             }
-
-            iterationArray[iY * iXmax + iX] = Iteration;  // 保存迭代次数
+            Iteration++;
         }
-    }
 
+        iterationArray[iY * iXmax + iX] = Iteration;  // 保存迭代次数
+    }
+}
     mpfr_clears(Cx, Cy, Zx, Zy, Zx2, Zy2, temp, ER2, (mpfr_ptr)0);
     _endthreadex(0);
     return 0;
 }
+
+
+
+//读取文件函数
 void ParseParametersFromFile(const char* filename)
 {
     FILE* file = fopen(filename, "r");
@@ -127,6 +286,8 @@ void ParseParametersFromFile(const char* filename)
 
     // 声明一个足够大的缓冲区来存储每一行
     char line[1048576];  // 假设每行的最大长度为1048576个字符
+    
+    
 
     // 动态分配内存以存储长字符串
     center_x = (char*)malloc(1048576);
@@ -168,6 +329,15 @@ void ParseParametersFromFile(const char* filename)
 
     fgets(line, sizeof(line), file);  // 读取最大迭代次数
     sscanf(line, "%s", max_iter);
+    
+    // 在读取文件参数时，增加对 percentile 的读取
+    fgets(line, sizeof(line), file);  // 读取百分位数
+    if (sscanf(line, "%lf", &percentile) != 1) {
+        printf("Percentile not specified in file, using default value: 0.98\n");
+        percentile = 0.98;  // 如果读取失败，使用默认值
+    } else {
+    printf("Percentile specified in file: %.2f\n", percentile);
+    }
 
     fclose(file);
 
@@ -183,6 +353,8 @@ void ParseParametersFromFile(const char* filename)
 }
 
 
+
+//主函数
 int main(int argc, char* argv[])
 {
     if (argc != 2)
@@ -288,9 +460,19 @@ int main(int argc, char* argv[])
     mpfr_set(mpfrVars[11], iXmax_mp, MPFR_RNDN);    
     mpfr_set(mpfrVars[12], iYmax_mp, MPFR_RNDN);    
 
-    // 分配线程计算任务
-    int rowsPerThread = iYmax / NUM_THREADS;  
-    HANDLE hThreads[NUM_THREADS];  
+
+
+    // 计算采样点的迭代次数并确定新的最大迭代次数
+    int newMaxIter = CalculateNewMaxIter(iXmax, iYmax, mpfrVars, IterationMax);
+    printf("New Max Iterations based on sampling: %d\n", newMaxIter);
+
+    // 使用新的最大迭代次数重新计算整个图像
+    int rowsPerThread = iYmax / NUM_THREADS;
+    HANDLE hThreads[NUM_THREADS];
+
+
+
+
     for (int i = 0; i < NUM_THREADS; i++)  
     {
         int startRow = i * rowsPerThread;  
@@ -302,7 +484,7 @@ int main(int argc, char* argv[])
         threadParams[i].mpfrVars = mpfrVars;  
         threadParams[i].iXmax = iXmax;        
         threadParams[i].iYmax = iYmax;        
-        threadParams[i].IterationMax = IterationMax;  
+        threadParams[i].IterationMax = newMaxIter;  
 
         hThreads[i] = (HANDLE)_beginthreadex(NULL, 0, MandelbrotThread, (void*)&threadParams[i], 0, NULL);  
     }
